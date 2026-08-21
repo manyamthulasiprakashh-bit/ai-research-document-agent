@@ -1,0 +1,8 @@
+.env
+data/vector_store/
+data/storage/
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+*.py[cod]

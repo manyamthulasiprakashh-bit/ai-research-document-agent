@@ -1,0 +1,9 @@
+Artificial intelligence is transforming software engineering.
+
+Large language models can understand and generate natural language.
+
+An AI research assistant can analyze documents, retrieve relevant
+information, and generate answers based on trusted sources.
+
+Retrieval-Augmented Generation, or RAG, allows an AI system to retrieve
+relevant information before generating an answer.

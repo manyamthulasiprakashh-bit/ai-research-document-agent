@@ -1,0 +1,5 @@
+Retrieval-Augmented Generation combines information retrieval with language generation.
+
+A research assistant first searches a collection of documents for relevant passages. It then supplies those passages to a language model so the response can be grounded in source material.
+
+Source citations help readers trace an answer back to the documents that support it.

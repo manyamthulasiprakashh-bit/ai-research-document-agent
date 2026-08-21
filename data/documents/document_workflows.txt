@@ -1,0 +1,5 @@
+Document ingestion begins by loading source files and extracting their text.
+
+Text is cleaned to remove unnecessary whitespace and divided into overlapping chunks. Each chunk can be represented by an embedding and stored for similarity search.
+
+Keeping the original filename with every chunk makes retrieved evidence traceable.

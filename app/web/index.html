@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Research &amp; Document Agent</title>
+  <link rel="stylesheet" href="/ui/assets/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <p class="eyebrow">RESEARCH WORKSPACE</p>
+        <h1>AI Research &amp; Document Agent</h1>
+      </div>
+
+      <section class="sidebar-section">
+        <div class="section-heading">
+          <h2>Research sessions</h2>
+          <button class="icon-button" id="new-session-button" type="button" title="New research session">+</button>
+        </div>
+        <form id="session-form" class="session-form" hidden>
+          <label for="session-title">New Research Session</label>
+          <input id="session-title" type="text" placeholder="AI Agents Research" required>
+          <div class="form-actions">
+            <button type="submit">Create Session</button>
+            <button id="cancel-session-button" class="quiet-button" type="button">Cancel</button>
+          </div>
+        </form>
+        <p id="session-error" class="error" role="alert" hidden></p>
+        <div id="session-list" class="session-list"></div>
+      </section>
+
+      <section class="sidebar-section upload-section">
+        <h2>Index a document</h2>
+        <form id="upload-form">
+          <label for="document-file">TXT, PDF, or DOCX</label>
+          <input id="document-file" type="file" accept=".txt,.pdf,.docx" required>
+          <button type="submit">Upload Document</button>
+        </form>
+        <p id="upload-message" class="message" role="status" hidden></p>
+      </section>
+
+      <section class="sidebar-section metrics-section">
+        <div class="section-heading">
+          <h2>System Metrics</h2>
+          <button id="refresh-metrics-button" class="quiet-button" type="button">Refresh</button>
+        </div>
+        <div id="metrics-grid" class="metrics-grid"></div>
+        <button id="run-evaluation-button" class="metrics-button" type="button">Run Evaluation</button>
+        <p id="evaluation-message" class="message" role="status" hidden></p>
+      </section>
+    </aside>
+
+    <main class="workspace">
+      <header class="workspace-header">
+        <p class="eyebrow">LOCAL DOCUMENTS + WEB SOURCES</p>
+        <p class="intro">Research across your documents and the web.</p>
+      </header>
+
+      <section id="empty-state" class="empty-state">
+        <span class="empty-mark">+</span>
+        <h2>Start a research session</h2>
+        <p>Create a session from the sidebar, then ask a question to build a persistent research history.</p>
+        <button id="empty-new-session-button" type="button">New Research Session</button>
+      </section>
+
+      <section id="session-view" hidden>
+        <div class="session-header">
+          <div>
+            <p class="eyebrow">ACTIVE SESSION</p>
+            <h2 id="active-session-title"></h2>
+          </div>
+          <span id="session-status" class="status-pill">Ready</span>
+        </div>
+
+        <section class="research-card">
+          <form id="research-form">
+            <label for="question">Research question</label>
+            <textarea id="question" rows="3" placeholder="Ask a research question..." required></textarea>
+            <div class="research-actions">
+              <span class="hint">Grounded in retrieved evidence and cited sources.</span>
+              <button id="research-button" type="submit">Ask Research Question</button>
+            </div>
+          </form>
+          <p id="research-error" class="error" role="alert" hidden></p>
+        </section>
+
+        <section class="history-section">
+          <div class="section-heading">
+            <h2>Research history</h2>
+            <span id="history-count" class="muted-label"></span>
+          </div>
+          <div id="history-list" class="history-list"></div>
+        </section>
+      </section>
+      <section id="evaluation-panel" class="evaluation-panel" hidden>
+        <div class="section-heading">
+          <h2>RAG Evaluation</h2>
+          <span id="evaluation-count" class="muted-label"></span>
+        </div>
+        <div id="evaluation-results" class="evaluation-results"></div>
+      </section>
+    </main>
+  </div>
+  <script src="/ui/assets/app.js"></script>
+</body>
+</html>
