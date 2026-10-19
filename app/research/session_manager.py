@@ -5,13 +5,16 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+PUBLIC_SCOPE = "public"
+LEGACY_SCOPE = "legacy"
+
 
 class SessionNotFoundError(LookupError):
-    """Raised when a research session does not exist."""
+    """Raised when a research session does not exist or is not owned."""
 
 
 class ResearchSessionManager:
-    """Persist research sessions and their results in SQLite."""
+    """Persist owner-scoped research sessions and their results in SQLite."""
 
     def __init__(self, path: str | Path = "data/storage/research_sessions.db") -> None:
         """Open or create the research session database."""
@@ -26,6 +29,12 @@ class ResearchSessionManager:
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._create_tables()
+        self._migrate()
+
+    @staticmethod
+    def _scope(owner_id: str | None) -> str:
+        """Return the normalized owner scope for an optional owner id."""
+        return owner_id or PUBLIC_SCOPE
 
     def _create_tables(self) -> None:
         with self._lock, self._connection:
@@ -34,6 +43,7 @@ class ResearchSessionManager:
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -56,12 +66,28 @@ class ResearchSessionManager:
                 """
             )
 
+    def _migrate(self) -> None:
+        """Add ownership to session databases created before this feature."""
+        with self._lock, self._connection:
+            columns = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(sessions)"
+                ).fetchall()
+            }
+            if "owner_id" in columns:
+                return
+            self._connection.execute(
+                "ALTER TABLE sessions ADD COLUMN owner_id TEXT NOT NULL "
+                f"DEFAULT '{LEGACY_SCOPE}'"
+            )
+
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    def create_session(self, title: str) -> dict[str, str]:
-        """Create and persist a new research session."""
+    def create_session(self, title: str, owner_id: str | None = None) -> dict[str, str]:
+        """Create and persist a new research session for one owner."""
         clean_title = title.strip()
         if not clean_title:
             raise ValueError("title cannot be empty")
@@ -74,40 +100,49 @@ class ResearchSessionManager:
         with self._lock, self._connection:
             self._connection.execute(
                 """
-                INSERT INTO sessions (session_id, title, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO sessions
+                    (session_id, title, owner_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     session["session_id"],
                     session["title"],
+                    self._scope(owner_id),
                     session["created_at"],
                     session["created_at"],
                 ),
             )
         return session
 
-    def list_sessions(self) -> list[dict[str, str]]:
-        """Return all sessions ordered by most recently updated."""
+    def list_sessions(self, owner_id: str | None = None) -> list[dict[str, str]]:
+        """Return sessions owned by one owner, most recently updated first."""
         with self._lock:
             rows = self._connection.execute(
                 """
                 SELECT session_id, title, created_at, updated_at
                 FROM sessions
+                WHERE owner_id = ?
                 ORDER BY updated_at DESC
-                """
+                """,
+                (self._scope(owner_id),),
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_session(self, session_id: str) -> dict[str, object]:
-        """Return session metadata and its complete research history."""
+    def get_session(
+        self,
+        session_id: str,
+        owner_id: str | None = None,
+    ) -> dict[str, object]:
+        """Return one owned session's metadata and its research history."""
+        scope = self._scope(owner_id)
         with self._lock:
             session_row = self._connection.execute(
                 """
                 SELECT session_id, title, created_at, updated_at
                 FROM sessions
-                WHERE session_id = ?
+                WHERE session_id = ? AND owner_id = ?
                 """,
-                (session_id,),
+                (session_id, scope),
             ).fetchone()
             if not session_row:
                 raise SessionNotFoundError(f"Session not found: {session_id}")
@@ -147,16 +182,18 @@ class ResearchSessionManager:
         used_local_documents: bool,
         used_web_search: bool,
         errors: list[str] | None = None,
+        owner_id: str | None = None,
     ) -> dict[str, object]:
-        """Save one research result and update its session timestamp."""
+        """Save one result for an owned session and update its timestamp."""
         created_at = self._now()
         serialized_sources = json.dumps(sources)
         serialized_errors = json.dumps(errors or [])
+        scope = self._scope(owner_id)
 
         with self._lock, self._connection:
             exists = self._connection.execute(
-                "SELECT 1 FROM sessions WHERE session_id = ?",
-                (session_id,),
+                "SELECT 1 FROM sessions WHERE session_id = ? AND owner_id = ?",
+                (session_id, scope),
             ).fetchone()
             if not exists:
                 raise SessionNotFoundError(f"Session not found: {session_id}")
@@ -194,12 +231,16 @@ class ResearchSessionManager:
             "created_at": created_at,
         }
 
-    def delete_session(self, session_id: str) -> bool:
-        """Delete a session and its research history."""
+    def delete_session(
+        self,
+        session_id: str,
+        owner_id: str | None = None,
+    ) -> bool:
+        """Delete an owned session and its research history."""
         with self._lock, self._connection:
             cursor = self._connection.execute(
-                "DELETE FROM sessions WHERE session_id = ?",
-                (session_id,),
+                "DELETE FROM sessions WHERE session_id = ? AND owner_id = ?",
+                (session_id, self._scope(owner_id)),
             )
             return cursor.rowcount > 0
 

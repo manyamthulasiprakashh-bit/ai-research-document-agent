@@ -61,8 +61,13 @@ class VectorStore:
         self,
         query_embedding: list[float],
         top_k: int = 3,
+        owner_id: str | None = None,
     ) -> list[dict[str, str | float]]:
-        """Return the top matching chunks ranked by cosine similarity."""
+        """Return the top matching chunks ranked by cosine similarity.
+
+        This in-memory store is single-owner. The ``owner_id`` parameter is
+        accepted for API compatibility with the persistent store and ignored.
+        """
         if top_k <= 0:
             return []
 

@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +11,16 @@ from app.research.research_router import ResearchResult
 
 
 class ApiTests(unittest.TestCase):
+    API_KEYS = "owner-a:key-a,owner-b:key-b"
+    OWNER_A = "owner-a"
+    OWNER_B = "owner-b"
+    KEY_A = "key-a"
+    KEY_B = "key-b"
+    API_HEADERS = {"X-API-Key": "key-a"}
+
     def setUp(self) -> None:
+        self.env_patch = patch.dict(os.environ, {"API_KEYS": self.API_KEYS})
+        self.env_patch.start()
         self.test_storage = tempfile.TemporaryDirectory()
         self.storage_patch = patch("app.api.VECTOR_STORE_PATH", Path(self.test_storage.name))
         self.storage_patch.start()
@@ -26,6 +36,12 @@ class ApiTests(unittest.TestCase):
             Path(self.metrics_storage.name) / "metrics.db",
         )
         self.metrics_storage_patch.start()
+        self.audit_storage = tempfile.TemporaryDirectory()
+        self.audit_storage_patch = patch(
+            "app.api.AUDIT_STORE_PATH",
+            Path(self.audit_storage.name) / "audit.db",
+        )
+        self.audit_storage_patch.start()
 
     def tearDown(self) -> None:
         self.storage_patch.stop()
@@ -34,9 +50,12 @@ class ApiTests(unittest.TestCase):
         self.session_storage.cleanup()
         self.metrics_storage_patch.stop()
         self.metrics_storage.cleanup()
+        self.audit_storage_patch.stop()
+        self.audit_storage.cleanup()
+        self.env_patch.stop()
 
     def test_root_health_and_openapi(self) -> None:
-        with patch("app.api.process_documents", return_value=[]), TestClient(app) as client:
+        with patch("app.api.process_directory_tree", return_value=[]), TestClient(app, headers=self.API_HEADERS) as client:
             root_response = client.get("/")
             health_response = client.get("/health")
             docs_response = client.get("/docs")
@@ -51,7 +70,7 @@ class ApiTests(unittest.TestCase):
         self.assertIn("/research", schema_response.json()["paths"])
 
     def test_ui_returns_complete_page_and_assets(self) -> None:
-        with patch("app.api.process_documents", return_value=[]), TestClient(app) as client:
+        with patch("app.api.process_directory_tree", return_value=[]), TestClient(app, headers=self.API_HEADERS) as client:
             page_response = client.get("/ui")
             css_response = client.get("/ui/assets/styles.css")
             javascript_response = client.get("/ui/assets/app.js")
@@ -67,9 +86,9 @@ class ApiTests(unittest.TestCase):
 
     def test_health_remains_available_when_ingestion_fails(self) -> None:
         with patch(
-            "app.api.process_documents",
+            "app.api.process_directory_tree",
             side_effect=RuntimeError("GEMINI_API_KEY is missing"),
-        ), TestClient(app) as client:
+        ), TestClient(app, headers=self.API_HEADERS) as client:
             response = client.get("/health")
 
         self.assertEqual(response.status_code, 200)
@@ -89,7 +108,7 @@ class ApiTests(unittest.TestCase):
             ],
             answer="RAG retrieves context before generation.",
         )
-        with patch("app.api.process_documents", return_value=[]), TestClient(app) as client:
+        with patch("app.api.process_directory_tree", return_value=[]), TestClient(app, headers=self.API_HEADERS) as client:
             with patch.object(
                 client.app.state.research_router,
                 "research_question",
@@ -105,16 +124,16 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(response.json()["used_local_documents"])
         self.assertFalse(response.json()["used_web_search"])
         self.assertEqual(response.json()["sources"][0]["source"], "sample.txt")
-        research_question.assert_called_once_with("What is RAG?")
+        research_question.assert_called_once_with("What is RAG?", owner_id=self.OWNER_A)
 
     def test_empty_question_is_rejected(self) -> None:
-        with patch("app.api.process_documents", return_value=[]), TestClient(app) as client:
+        with patch("app.api.process_directory_tree", return_value=[]), TestClient(app, headers=self.API_HEADERS) as client:
             response = client.post("/research", json={"question": "   "})
 
         self.assertEqual(response.status_code, 422)
 
     def test_research_router_error_is_handled(self) -> None:
-        with patch("app.api.process_documents", return_value=[]), TestClient(app) as client:
+        with patch("app.api.process_directory_tree", return_value=[]), TestClient(app, headers=self.API_HEADERS) as client:
             with patch.object(
                 client.app.state.research_router,
                 "research_question",
@@ -128,8 +147,38 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["detail"], "Research service is temporarily unavailable.")
 
+    def test_research_errors_are_sanitized_for_clients(self) -> None:
+        fake_result = ResearchResult(
+            question="What is RAG?",
+            routing_decision="web search",
+            answer="An answer.",
+            errors=[
+                "GEMINI_API_KEY is missing",
+                "provider exploded at https://internal.example/trace",
+            ],
+        )
+        with patch("app.api.process_directory_tree", return_value=[]), TestClient(
+            app, headers=self.API_HEADERS
+        ) as client:
+            with patch.object(
+                client.app.state.research_router,
+                "research_question",
+                return_value=fake_result,
+            ):
+                response = client.post(
+                    "/research",
+                    json={"question": "What is RAG?"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        errors = response.json()["errors"]
+        self.assertTrue(errors)
+        joined = " ".join(errors)
+        self.assertNotIn("GEMINI_API_KEY", joined)
+        self.assertNotIn("internal.example", joined)
+
     def test_upload_rejects_unsupported_file_type(self) -> None:
-        with patch("app.api.process_documents", return_value=[]), TestClient(app) as client:
+        with patch("app.api.process_directory_tree", return_value=[]), TestClient(app, headers=self.API_HEADERS) as client:
             response = client.post(
                 "/documents/upload",
                 files={"file": ("notes.exe", b"not supported", "application/octet-stream")},
@@ -142,7 +191,7 @@ class ApiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             document_directory = Path(directory) / "documents"
             with patch("app.api.DOCUMENT_DIRECTORY", document_directory), patch(
-                "app.api.process_documents", return_value=["uploaded.txt"]
+                "app.api.process_directory_tree", return_value=["uploaded.txt"]
             ), patch(
                 "app.api.process_document",
                 return_value={
@@ -151,26 +200,27 @@ class ApiTests(unittest.TestCase):
                     "chunks_created": 1,
                     "status": "indexed",
                 },
-            ) as process_document, TestClient(app) as client:
+            ) as process_document, TestClient(app, headers=self.API_HEADERS) as client:
                 response = client.post(
                     "/documents/upload",
                     files={"file": ("uploaded.txt", b"A research note.", "text/plain")},
                 )
 
             self.assertEqual(response.status_code, 200)
-            self.assertTrue((document_directory / "uploaded.txt").exists())
+            self.assertTrue((document_directory / self.OWNER_A / "uploaded.txt").exists())
             self.assertEqual(response.json()["filename"], "uploaded.txt")
             self.assertEqual(response.json()["document_id"], "doc-uploaded")
             self.assertEqual(response.json()["chunks_created"], 1)
             process_document.assert_called_once()
 
     def test_documents_lists_persistent_metadata(self) -> None:
-        with patch("app.api.process_documents", return_value=[]), TestClient(app) as client:
+        with patch("app.api.process_directory_tree", return_value=[]), TestClient(app, headers=self.API_HEADERS) as client:
             client.app.state.vector_store.add_document(
                 document_id="doc-list",
                 filename="listed.txt",
                 fingerprint="fingerprint-list",
                 chunks=[("listed.txt:chunk-1", "content", [1.0, 0.0])],
+                owner_id=self.OWNER_A,
             )
             response = client.get("/documents")
 
@@ -179,12 +229,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.json()["documents"][0]["chunks"], 1)
 
     def test_documents_delete_removes_persistent_metadata(self) -> None:
-        with patch("app.api.process_documents", return_value=[]), TestClient(app) as client:
+        with patch("app.api.process_directory_tree", return_value=[]), TestClient(app, headers=self.API_HEADERS) as client:
             client.app.state.vector_store.add_document(
                 document_id="doc-delete-api",
                 filename="delete.txt",
                 fingerprint="fingerprint-delete-api",
                 chunks=[("delete.txt:chunk-1", "content", [1.0, 0.0])],
+                owner_id=self.OWNER_A,
             )
             response = client.delete("/documents/doc-delete-api")
             missing_response = client.delete("/documents/doc-delete-api")
@@ -194,7 +245,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(missing_response.status_code, 404)
 
     def test_create_and_list_sessions(self) -> None:
-        with patch("app.api.process_documents", return_value=[]), TestClient(app) as client:
+        with patch("app.api.process_directory_tree", return_value=[]), TestClient(app, headers=self.API_HEADERS) as client:
             create_response = client.post("/sessions", json={"title": "RAG Research"})
             list_response = client.get("/sessions")
 
@@ -219,7 +270,7 @@ class ApiTests(unittest.TestCase):
             ],
             answer="RAG retrieves context before generation.",
         )
-        with patch("app.api.process_documents", return_value=[]), TestClient(app) as client:
+        with patch("app.api.process_directory_tree", return_value=[]), TestClient(app, headers=self.API_HEADERS) as client:
             session_id = client.post("/sessions", json={"title": "RAG Research"}).json()["session_id"]
             with patch.object(
                 client.app.state.research_router,
@@ -237,10 +288,10 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(detail_response.status_code, 200)
         self.assertEqual(detail_response.json()["title"], "RAG Research")
         self.assertEqual(detail_response.json()["questions"][0]["answer"], fake_result.answer)
-        research_question.assert_called_once_with("What is RAG?")
+        research_question.assert_called_once_with("What is RAG?", owner_id=self.OWNER_A)
 
     def test_session_delete_and_invalid_session(self) -> None:
-        with patch("app.api.process_documents", return_value=[]), TestClient(app) as client:
+        with patch("app.api.process_directory_tree", return_value=[]), TestClient(app, headers=self.API_HEADERS) as client:
             session_id = client.post("/sessions", json={"title": "Temporary"}).json()["session_id"]
             delete_response = client.delete(f"/sessions/{session_id}")
             detail_response = client.get(f"/sessions/{session_id}")
@@ -254,7 +305,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(research_response.status_code, 404)
 
     def test_session_empty_title_and_question_are_rejected(self) -> None:
-        with patch("app.api.process_documents", return_value=[]), TestClient(app) as client:
+        with patch("app.api.process_directory_tree", return_value=[]), TestClient(app, headers=self.API_HEADERS) as client:
             empty_title = client.post("/sessions", json={"title": "   "})
             session_id = client.post("/sessions", json={"title": "Valid"}).json()["session_id"]
             empty_question = client.post(
@@ -266,7 +317,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(empty_question.status_code, 422)
 
     def test_metrics_endpoint_returns_aggregates(self) -> None:
-        with patch("app.api.process_documents", return_value=[]), TestClient(app) as client:
+        with patch("app.api.process_directory_tree", return_value=[]), TestClient(app, headers=self.API_HEADERS) as client:
             response = client.get("/metrics")
 
         self.assertEqual(response.status_code, 200)
@@ -287,7 +338,7 @@ class ApiTests(unittest.TestCase):
             ],
             answer="research_notes.txt explains retrieval and generation.",
         )
-        with patch("app.api.process_documents", return_value=[]), TestClient(app) as client:
+        with patch("app.api.process_directory_tree", return_value=[]), TestClient(app, headers=self.API_HEADERS) as client:
             with patch.object(
                 client.app.state.research_router,
                 "research_question",
@@ -309,7 +360,7 @@ class ApiTests(unittest.TestCase):
             local_results=[{"source": "research_notes.txt", "score": 0.9}],
             answer="retrieval generation research_notes.txt",
         )
-        with patch("app.api.process_documents", return_value=[]), TestClient(app) as client:
+        with patch("app.api.process_directory_tree", return_value=[]), TestClient(app, headers=self.API_HEADERS) as client:
             with patch.object(
                 client.app.state.research_router,
                 "research_question",
