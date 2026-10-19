@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+PUBLIC_SCOPE = "public"
+LEGACY_SCOPE = "legacy"
+
 
 @dataclass(frozen=True)
 class IndexedDocument:
@@ -20,7 +23,12 @@ class IndexedDocument:
 
 
 class PersistentVectorStore:
-    """SQLite-backed vector store for single-machine document retrieval."""
+    """SQLite-backed vector store for single-machine document retrieval.
+
+    Documents are owned by exactly one owner. Retrieval, listing, and deletion
+    are scoped to an owner so one owner can never observe another owner's
+    document metadata, chunks, or embeddings.
+    """
 
     def __init__(self, path: str | Path | None = None) -> None:
         """Open or create a persistent vector store database."""
@@ -42,6 +50,7 @@ class PersistentVectorStore:
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._create_tables()
+        self._migrate()
 
     @staticmethod
     def fingerprint(content: bytes) -> str:
@@ -49,9 +58,30 @@ class PersistentVectorStore:
         return hashlib.sha256(content).hexdigest()
 
     @staticmethod
-    def document_id_for(fingerprint: str) -> str:
-        """Return a stable document ID derived from a content fingerprint."""
-        return f"doc-{fingerprint}"
+    def _scope(owner_id: str | None) -> str:
+        """Return the normalized owner scope for an optional owner id."""
+        return owner_id or PUBLIC_SCOPE
+
+    @classmethod
+    def fingerprint_key(cls, fingerprint: str, owner_id: str | None = None) -> str:
+        """Return an owner-scoped storage key so dedup is per owner."""
+        return f"{cls._scope(owner_id)}:{fingerprint}"
+
+    @classmethod
+    def document_id_for(
+        cls,
+        fingerprint: str,
+        owner_id: str | None = None,
+    ) -> str:
+        """Return an owner-scoped stable document ID for a content fingerprint."""
+        scope = cls._scope(owner_id)
+        digest = hashlib.sha256(f"{scope}:{fingerprint}".encode()).hexdigest()
+        return f"doc-{digest}"
+
+    @staticmethod
+    def _strip_scope(stored_key: str) -> str:
+        """Return the raw content fingerprint from an owner-scoped key."""
+        return stored_key.split(":", 1)[1] if ":" in stored_key else stored_key
 
     def _create_tables(self) -> None:
         with self._lock, self._connection:
@@ -61,6 +91,7 @@ class PersistentVectorStore:
                     document_id TEXT PRIMARY KEY,
                     filename TEXT NOT NULL,
                     fingerprint TEXT NOT NULL UNIQUE,
+                    owner_id TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -80,20 +111,53 @@ class PersistentVectorStore:
                 """
             )
 
+    def _migrate(self) -> None:
+        """Add ownership to databases created before this feature.
+
+        The migration only adds a column and rewrites the stored fingerprint to
+        its owner-scoped form. Existing document IDs, chunks, and embeddings are
+        preserved. Rows created before ownership existed are assigned to the
+        legacy owner.
+        """
+        with self._lock, self._connection:
+            columns = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(documents)"
+                ).fetchall()
+            }
+            if "owner_id" in columns:
+                return
+
+            self._connection.execute(
+                "ALTER TABLE documents ADD COLUMN owner_id TEXT"
+            )
+            self._connection.execute(
+                """
+                UPDATE documents
+                SET owner_id = ?, fingerprint = ? || ':' || fingerprint
+                WHERE owner_id IS NULL
+                """,
+                (LEGACY_SCOPE, LEGACY_SCOPE),
+            )
+
     def add_document(
         self,
         document_id: str,
         filename: str,
         fingerprint: str,
         chunks: list[tuple[str, str, list[float]]],
+        owner_id: str | None = None,
     ) -> dict[str, object]:
-        """Add a document and all chunks atomically, skipping duplicates."""
+        """Add a document and all chunks atomically, skipping per-owner duplicates."""
         now = datetime.now(timezone.utc).isoformat()
+        scope = self._scope(owner_id)
+        stored_key = self.fingerprint_key(fingerprint, owner_id)
 
         with self._lock, self._connection:
             existing = self._connection.execute(
                 "SELECT document_id, filename FROM documents WHERE fingerprint = ?",
-                (fingerprint,),
+                (stored_key,),
             ).fetchone()
             if existing:
                 existing_count = self._connection.execute(
@@ -110,10 +174,11 @@ class PersistentVectorStore:
             self._connection.execute(
                 """
                 INSERT INTO documents
-                    (document_id, filename, fingerprint, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                    (document_id, filename, fingerprint, owner_id,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (document_id, filename, fingerprint, now, now),
+                (document_id, filename, stored_key, scope, now, now),
             )
             self._connection.executemany(
                 """
@@ -148,17 +213,20 @@ class PersistentVectorStore:
         embedding: list[float],
         source: str,
         document_id: str | None = None,
+        owner_id: str | None = None,
     ) -> None:
         """Add one chunk for compatibility with the in-memory store API."""
-        resolved_document_id = document_id or self.document_id_for(
-            self.fingerprint(source.encode())
-        )
         fingerprint = self.fingerprint(source.encode())
+        resolved_document_id = document_id or self.document_id_for(
+            fingerprint,
+            owner_id,
+        )
         self.add_document(
             resolved_document_id,
             source,
             fingerprint,
             [(chunk_id, text, embedding)],
+            owner_id=owner_id,
         )
 
     @staticmethod
@@ -184,17 +252,26 @@ class PersistentVectorStore:
         self,
         query_embedding: list[float],
         top_k: int = 3,
+        owner_id: str | None = None,
     ) -> list[dict[str, str | float]]:
-        """Return the top matching chunks from persistent storage."""
+        """Return the top matching chunks owned by the requested owner.
+
+        Owner filtering happens in SQL before any ranking, so unauthorized
+        chunks are never scored or returned.
+        """
         if top_k <= 0:
             return []
 
+        scope = self._scope(owner_id)
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT chunk_id, source, text, embedding
-                FROM chunks
-                """
+                SELECT c.chunk_id, c.source, c.text, c.embedding
+                FROM chunks c
+                JOIN documents d ON c.document_id = d.document_id
+                WHERE d.owner_id = ?
+                """,
+                (scope,),
             ).fetchall()
 
         results = []
@@ -212,49 +289,91 @@ class PersistentVectorStore:
         results.sort(key=lambda result: float(result["score"]), reverse=True)
         return results[:top_k]
 
-    def delete_document(self, document_id: str) -> bool:
-        """Delete a document and its chunks, returning whether it existed."""
+    def get_document(
+        self,
+        document_id: str,
+        owner_id: str | None = None,
+    ) -> dict[str, str | int] | None:
+        """Return one owned document's metadata, if the owner owns it."""
+        scope = self._scope(owner_id)
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT d.document_id, d.filename, d.fingerprint, d.owner_id,
+                       d.created_at, d.updated_at,
+                       COUNT(c.chunk_id) AS chunks
+                FROM documents d
+                LEFT JOIN chunks c ON c.document_id = d.document_id
+                WHERE d.document_id = ? AND d.owner_id = ?
+                GROUP BY d.document_id
+                """,
+                (document_id, scope),
+            ).fetchone()
+        return self._document_dict(row) if row else None
+
+    def delete_document(
+        self,
+        document_id: str,
+        owner_id: str | None = None,
+    ) -> bool:
+        """Delete an owned document and its chunks, returning whether it existed."""
+        scope = self._scope(owner_id)
         with self._lock, self._connection:
             cursor = self._connection.execute(
-                "DELETE FROM documents WHERE document_id = ?",
-                (document_id,),
+                "DELETE FROM documents WHERE document_id = ? AND owner_id = ?",
+                (document_id, scope),
             )
             return cursor.rowcount > 0
 
-    def list_documents(self) -> list[dict[str, str | int]]:
-        """Return indexed document metadata and chunk counts."""
+    def list_documents(
+        self,
+        owner_id: str | None = None,
+    ) -> list[dict[str, str | int]]:
+        """Return indexed document metadata for one owner and chunk counts."""
+        scope = self._scope(owner_id)
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT d.document_id, d.filename, d.fingerprint,
+                SELECT d.document_id, d.filename, d.fingerprint, d.owner_id,
                        d.created_at, d.updated_at, COUNT(c.chunk_id) AS chunks
                 FROM documents d
                 LEFT JOIN chunks c ON c.document_id = d.document_id
+                WHERE d.owner_id = ?
                 GROUP BY d.document_id
                 ORDER BY d.filename COLLATE NOCASE
-                """
+                """,
+                (scope,),
             ).fetchall()
 
-        return [dict(row) for row in rows]
+        return [self._document_dict(row) for row in rows]
 
     def get_document_by_fingerprint(
         self,
         fingerprint: str,
+        owner_id: str | None = None,
     ) -> dict[str, str | int] | None:
-        """Return indexed document metadata for a fingerprint, if present."""
+        """Return owned document metadata for a content fingerprint, if present."""
+        scope = self._scope(owner_id)
+        stored_key = self.fingerprint_key(fingerprint, owner_id)
         with self._lock:
             row = self._connection.execute(
                 """
-                SELECT d.document_id, d.filename, d.fingerprint,
+                SELECT d.document_id, d.filename, d.fingerprint, d.owner_id,
                        d.created_at, d.updated_at, COUNT(c.chunk_id) AS chunks
                 FROM documents d
                 LEFT JOIN chunks c ON c.document_id = d.document_id
-                WHERE d.fingerprint = ?
+                WHERE d.fingerprint = ? AND d.owner_id = ?
                 GROUP BY d.document_id
                 """,
-                (fingerprint,),
+                (stored_key, scope),
             ).fetchone()
-        return dict(row) if row else None
+        return self._document_dict(row) if row else None
+
+    def _document_dict(self, row: sqlite3.Row) -> dict[str, str | int]:
+        """Convert a joined document row and hide the internal scoped key."""
+        document = dict(row)
+        document["fingerprint"] = self._strip_scope(str(document["fingerprint"]))
+        return document
 
     def count(self) -> int:
         """Return the number of stored chunks."""

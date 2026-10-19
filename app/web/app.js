@@ -19,10 +19,17 @@ const evaluationPanel = document.querySelector("#evaluation-panel");
 const evaluationResults = document.querySelector("#evaluation-results");
 const evaluationCount = document.querySelector("#evaluation-count");
 const evaluationMessage = document.querySelector("#evaluation-message");
+const apiKeyInput = document.querySelector("#api-key");
 
 let activeSessionId = null;
 
 window.addEventListener("DOMContentLoaded", () => {
+  apiKeyInput.value = window.localStorage.getItem("apiKey") || "";
+  loadSessions();
+  loadMetrics();
+});
+apiKeyInput.addEventListener("change", () => {
+  window.localStorage.setItem("apiKey", apiKeyInput.value.trim());
   loadSessions();
   loadMetrics();
 });
@@ -290,7 +297,10 @@ async function runEvaluation() {
 }
 
 async function request(url, options = {}) {
-  const response = await fetch(url, options);
+  const headers = new Headers(options.headers || {});
+  const apiKey = apiKeyInput.value.trim();
+  if (apiKey) headers.set("X-API-Key", apiKey);
+  const response = await fetch(url, { ...options, headers });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.detail || "The server could not complete the request.");
   return data;

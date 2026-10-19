@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 from dataclasses import dataclass, field
@@ -6,6 +7,8 @@ from app.generation.answer_generator import generate_answer
 from app.research.web_search import WebSearchError, WebSearcher
 from app.retrieval.embeddings import create_query_embedding
 from app.retrieval.vector_store import VectorStore
+
+logger = logging.getLogger(__name__)
 
 INSUFFICIENT_INFORMATION = (
     "There is not enough reliable information in the available local documents "
@@ -66,8 +69,16 @@ class ResearchRouter:
 
         return threshold
 
-    def research_question(self, question: str) -> ResearchResult:
-        """Retrieve evidence, optionally search the web, and generate an answer."""
+    def research_question(
+        self,
+        question: str,
+        owner_id: str | None = None,
+    ) -> ResearchResult:
+        """Retrieve evidence, optionally search the web, and generate an answer.
+
+        Owner filtering is applied inside the vector store before ranking so
+        unauthorized documents are never scored or sent to an AI provider.
+        """
         if not question.strip():
             raise ValueError("question cannot be empty")
 
@@ -79,10 +90,12 @@ class ResearchRouter:
             local_results = self.vector_store.search(
                 query_embedding,
                 top_k=self.local_top_k,
+                owner_id=owner_id,
             )
         except (RuntimeError, ValueError) as error:
             local_results = []
             errors.append(str(error))
+            logger.warning("Local retrieval failed: %s", error)
         retrieval_latency_ms = (time.perf_counter() - retrieval_start) * 1000
 
         best_score = self._best_score(local_results)
@@ -97,6 +110,7 @@ class ResearchRouter:
                 )
             except WebSearchError as error:
                 errors.append(str(error))
+                logger.warning("Web search failed: %s", error)
 
         evidence = self._build_evidence(local_results, web_results)
         generation_start = time.perf_counter()
@@ -109,6 +123,7 @@ class ResearchRouter:
             except Exception as error:
                 errors.append(str(error))
                 answer = INSUFFICIENT_INFORMATION
+                logger.warning("Answer generation failed: %s", error)
             generation_latency_ms = (time.perf_counter() - generation_start) * 1000
 
         return ResearchResult(
